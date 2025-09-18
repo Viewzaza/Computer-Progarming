@@ -281,7 +281,7 @@ class OrbitGUI:
         ttk.Label(frm_input, text="record every N step:").grid(row=2, column=0, sticky="e")
         ttk.Entry(frm_input, textvariable=self.record_every_var, width=6).grid(row=2, column=1, sticky="w")
         ttk.Label(frm_input, text="mu (m^3/s^2):").grid(row=2, column=2, sticky="e")
-        ttk.Entry(frm_input, textvariable=self.mu_var, width=16).grid(row=2, column=3, sticky="w")
+        ttk.Entry(frm_input, textvariable=self.mu_var, width=30).grid(row=2, column=3, sticky="w")
 
         # buttons
         ttk.Button(frm_buttons, text="Run Batch", command=self.run_batch).pack(fill=tk.X, pady=2)
