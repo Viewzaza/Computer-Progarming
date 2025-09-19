@@ -1,13 +1,16 @@
+# orbit_propagator_with_map.py
+# Responsive RK4 orbit propagator GUI with:
+#  - 2D ground-track with Blue Marble/equirectangular background
+#  - 3D trajectories with Earth sphere
+#  - Load CSV (state vectors), optional TLE (sgp4)
+#  - Hover info on ground tracks
+#  - Threaded propagation with progress, robust image loading (skips directories)
+#  - CLEAR TLE button (removes TLE-loaded sats) and CLEAR ALL button
+#
+# Run: python orbit_propagator_with_map.py
+# Requires: numpy, matplotlib. Recommended: pillow (pip install pillow). Optional: sgp4.
 
-
-# RK4 two-body orbit propagator + optional TLE parsing (sgp4) + batch + GUI + visualization
-# Works on Windows: run with `python orbit_propagator_gui.py`
-# Dependencies: numpy, matplotlib. Optional: sgp4 (pip install sgp4)
-
-import os
-import math
-import threading
-import csv
+import os, math, threading, csv, traceback
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -15,10 +18,18 @@ from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from mpl_toolkits.mplot3d import Axes3D  # noqa
 
-# optional sgp4
+# Pillow for robust image reading + downscaling
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+# Optional sgp4
 SGP4_AVAILABLE = False
 try:
     from sgp4.api import Satrec, jday
@@ -26,406 +37,510 @@ try:
 except Exception:
     SGP4_AVAILABLE = False
 
-# ---------------------------
-# Constants (SI units)
-# ---------------------------
-MU_EARTH = 3.986004418e14  # m^3 / s^2
+# Constants
+R_EARTH = 6371000.0
+MU_EARTH = 3.986004418e14
 
-# ---------------------------
-# Physics: two-body & RK4
-# ---------------------------
+# --- Physics + RK4 ---
 def accel_two_body(r, mu=MU_EARTH):
     rnorm = np.linalg.norm(r)
-    if rnorm == 0:
+    if rnorm <= 0:
         return np.zeros(3)
     return -mu * r / (rnorm**3)
 
 def state_derivative(state, mu=MU_EARTH):
-    # state: [rx, ry, rz, vx, vy, vz]
-    r = state[0:3]
-    v = state[3:6]
-    a = accel_two_body(r, mu)
-    return np.hstack((v, a))
+    r = state[:3]; v = state[3:]
+    return np.hstack((v, accel_two_body(r, mu)))
 
-def rk4_step_state(state, dt, mu=MU_EARTH):
-    # state is numpy array length 6
+def rk4_step(state, dt, mu=MU_EARTH):
     k1 = state_derivative(state, mu)
     k2 = state_derivative(state + 0.5*dt*k1, mu)
     k3 = state_derivative(state + 0.5*dt*k2, mu)
     k4 = state_derivative(state + dt*k3, mu)
     return state + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
 
-def propagate_rk4_state(r0, v0, dt, steps, mu=MU_EARTH, record_every=1):
-    """Return list of (t_offset_s, r_vec (m), v_vec (m/s))."""
-    state = np.hstack((r0, v0)).astype(float)
-    history = []
-    history.append((0.0, state[0:3].copy(), state[3:6].copy()))
-    t = 0.0
+def propagate_rk4(r0, v0, dt, steps, record_every=1, mu=MU_EARTH, progress_cb=None, sat_index=0, total_sats=1):
+    s = np.hstack((r0, v0)).astype(float)
+    history = [(0.0, s[:3].copy(), s[3:].copy())]
+    update_every = max(1, steps // 20)
     for n in range(1, steps+1):
-        state = rk4_step_state(state, dt, mu)
-        t = n * dt
+        s = rk4_step(s, dt, mu)
         if n % record_every == 0:
-            history.append((t, state[0:3].copy(), state[3:6].copy()))
+            history.append((n*dt, s[:3].copy(), s[3:].copy()))
+        if (n % update_every) == 0 and progress_cb is not None:
+            frac = (n / steps)
+            progress_cb((sat_index + frac) / total_sats, f"sat {sat_index+1}/{total_sats} step {n}/{steps}")
     return history
 
-# ---------------------------
-# Utilities: state -> orbital elements (osculating)
-# ---------------------------
-def norm(v):
-    return np.linalg.norm(v)
+# --- Utilities ---
+def ecef_to_latlon(r):
+    x, y, z = r
+    r_xy = math.hypot(x, y)
+    lon = math.degrees(math.atan2(y, x))
+    lat = math.degrees(math.atan2(z, r_xy))
+    alt = math.sqrt(x*x + y*y + z*z) - R_EARTH
+    return lat, lon, alt
 
-def state_to_orbital(r, v, mu=MU_EARTH):
-    r = np.array(r, dtype=float)
-    v = np.array(v, dtype=float)
-    r_norm = norm(r)
-    v_norm = norm(v)
-    # angular momentum
-    h = np.cross(r, v)
-    h_norm = norm(h)
-    # eccentricity vector
-    e_vec = (np.cross(v, h) / mu) - (r / r_norm)
-    e = norm(e_vec)
-    # energy
-    energy = 0.5 * v_norm**2 - mu / r_norm
-    if energy == 0:
-        a = float('inf')
-    else:
-        a = -mu / (2 * energy)
-    # inclination
-    i = math.acos(h[2] / h_norm) if h_norm != 0 else 0.0
-    # node vector
-    K = np.array([0.0, 0.0, 1.0])
-    n_vec = np.cross(K, h)
-    n_norm = norm(n_vec)
-    # RAAN
-    RAAN = math.atan2(n_vec[1], n_vec[0]) if n_norm != 0 else 0.0
-    # argument of perigee
-    if n_norm != 0 and e > 1e-12:
-        arg_perigee = math.atan2(np.dot(np.cross(n_vec, e_vec), h)/(h_norm*n_norm),
-                                 np.dot(n_vec, e_vec)/(n_norm))
-    else:
-        arg_perigee = 0.0
-    # true anomaly
-    if e > 1e-12:
-        true_anom = math.atan2(np.dot(np.cross(e_vec, r), h)/(h_norm*e*r_norm),
-                               np.dot(e_vec, r)/(e*r_norm))
-    else:
-        # circular: use node vector to find reference for true anomaly
-        if n_norm != 0:
-            true_anom = math.atan2(np.dot(np.cross(n_vec, r), h)/(h_norm*n_norm),
-                                   np.dot(n_vec, r)/(n_norm))
+# --- CSV Reader ---
+def read_state_csv(path):
+    sats = {}
+    with open(path, newline='') as csvfile:
+        reader = csv.reader(csvfile)
+        first = next(reader, None)
+        if first is None:
+            return sats
+        is_header = any(any(c.isalpha() for c in cell) for cell in first)
+        if is_header:
+            header = [h.strip() for h in first]
+            cols = {name: idx for idx, name in enumerate(header)}
+            for row in reader:
+                if not row or all([c.strip()=='' for c in row]): continue
+                name = row[cols.get('sat_name','')] if 'sat_name' in cols else f"SAT_{len(sats)}"
+                try:
+                    rx = float(row[cols.get('rx_m','rx')]) if ('rx_m' in cols or 'rx' in cols) else float(row[0])
+                    ry = float(row[cols.get('ry_m','ry')]) if ('ry_m' in cols or 'ry' in cols) else float(row[1])
+                    rz = float(row[cols.get('rz_m','rz')]) if ('rz_m' in cols or 'rz' in cols) else float(row[2])
+                    vx = float(row[cols.get('vx_m_s','vx')]) if ('vx_m_s' in cols or 'vx' in cols) else float(row[3])
+                    vy = float(row[cols.get('vy_m_s','vy')]) if ('vy_m_s' in cols or 'vy' in cols) else float(row[4])
+                    vz = float(row[cols.get('vz_m_s','vz')]) if ('vz_m_s' in cols or 'vz' in cols) else float(row[5])
+                except Exception:
+                    continue
+                epoch = row[cols.get('epoch_iso','')] if 'epoch_iso' in cols else ''
+                sats.setdefault(name, []).append((epoch, 0.0, np.array([rx,ry,rz]), np.array([vx,vy,vz])))
         else:
-            true_anom = 0.0
-    # normalize angles [0,2pi)
-    def norm_ang(x):
-        return x % (2*math.pi)
-    RAAN = norm_ang(RAAN)
-    arg_perigee = norm_ang(arg_perigee)
-    true_anom = norm_ang(true_anom)
-    return {
-        'a': a, 'e': e, 'i': i,
-        'RAAN': RAAN, 'arg_perigee': arg_perigee, 'true_anomaly': true_anom,
-        'h_norm': h_norm, 'energy': energy
-    }
-
-# ---------------------------
-# TLE -> state using sgp4 (optional)
-# ---------------------------
-def tle_to_state(line1, line2):
-    """Return (r_m, v_m_s, epoch_datetime) using sgp4. Raises if sgp4 not installed or error."""
-    if not SGP4_AVAILABLE:
-        raise RuntimeError("sgp4 not installed. Install with `pip install sgp4` to use TLE input.")
-    sat = Satrec.twoline2rv(line1, line2)
-    jd = sat.jdsatepoch + sat.jdsatepochF
-    jd_int = int(jd)
-    fr = jd - jd_int
-    e, r_km, v_km_s = sat.sgp4(jd_int, fr)
-    if e != 0:
-        raise RuntimeError(f"SGP4 error code {e}")
-    r_m = np.array(r_km) * 1000.0
-    v_m_s = np.array(v_km_s) * 1000.0
-    epoch_dt = julian_day_to_datetime(jd)
-    return r_m, v_m_s, epoch_dt
-
-def julian_day_to_datetime(jd):
-    # convert JD -> datetime (UTC)
-    jd += 0.5
-    Z = int(jd)
-    F = jd - Z
-    if Z < 2299161:
-        A = Z
-    else:
-        alpha = int((Z - 1867216.25)/36524.25)
-        A = Z + 1 + alpha - int(alpha/4)
-    B = A + 1524
-    C = int((B - 122.1)/365.25)
-    D = int(365.25*C)
-    E = int((B - D)/30.6001)
-    day = B - D - int(30.6001*E) + F
-    if E < 14:
-        month = E - 1
-    else:
-        month = E - 13
-    if month > 2:
-        year = C - 4716
-    else:
-        year = C - 4715
-    day_int = int(day)
-    frac = day - day_int
-    hours = frac * 24.0
-    hh = int(hours)
-    minutes = (hours - hh) * 60.0
-    mm = int(minutes)
-    seconds = (minutes - mm) * 60.0
-    ss = seconds
-    try:
-        dt = datetime(year, month, day_int, hh, mm, int(ss), int((ss - int(ss))*1e6))
-    except Exception:
-        dt = datetime.utcnow()
-    return dt
-
-# ---------------------------
-# File I/O helpers
-# ---------------------------
-def read_batch_states_file(path):
-    entries = []
-    with open(path, 'r') as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith('#'):
-                continue
-            parts = s.split()
-            if len(parts) < 6:
-                continue
-            vals = list(map(float, parts[:6]))
-            r = np.array(vals[0:3], dtype=float)
-            v = np.array(vals[3:6], dtype=float)
-            entries.append((r, v))
-    return entries
-
-def read_tle_file(path):
-    with open(path, 'r') as f:
-        lines = [ln.rstrip("\n") for ln in f if ln.strip() != ""]
-    sats = []
-    i = 0
-    while i < len(lines):
-        if lines[i].startswith('1 ') or lines[i].startswith('2 '):
-            l1 = lines[i]
-            l2 = lines[i+1] if i+1 < len(lines) else ""
-            name = f"SAT_{len(sats)}"
-            sats.append((name, l1, l2))
-            i += 2
-        else:
-            name = lines[i]
-            l1 = lines[i+1] if i+1 < len(lines) else ""
-            l2 = lines[i+2] if i+2 < len(lines) else ""
-            sats.append((name, l1, l2))
-            i += 3
+            rows = [first] + list(reader)
+            for row in rows:
+                if not row or all([c.strip()=='' for c in row]): continue
+                parts = [p.strip() for p in row]
+                try:
+                    if len(parts) == 6:
+                        rx,ry,rz,vx,vy,vz = map(float, parts); name = f"SAT_{len(sats)}"
+                    elif len(parts) >= 7:
+                        name = parts[0]; rx,ry,rz,vx,vy,vz = map(float, parts[-6:])
+                    else:
+                        continue
+                except Exception:
+                    continue
+                sats.setdefault(name, []).append(('',0.0, np.array([rx,ry,rz]), np.array([vx,vy,vz])))
     return sats
 
-def save_results_csv(out_path, history_list):
-    with open(out_path, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        header = ["sat_name", "epoch_utc", "t_offset_s", "rx_m", "ry_m", "rz_m", "vx_m_s", "vy_m_s", "vz_m_s",
-                  "a_m", "e", "i_rad", "RAAN_rad", "arg_perigee_rad", "true_anomaly_rad"]
-        writer.writerow(header)
-        for sat in history_list:
-            name = sat.get('name', '')
-            epoch = sat.get('epoch', '')
-            rows = sat.get('history', [])
-            for t_offset, r, v in rows:
-                elems = state_to_orbital(r, v)
-                writer.writerow([name, epoch.isoformat() if hasattr(epoch, 'isoformat') else epoch,
-                                 f"{t_offset:.6f}",
-                                 f"{r[0]:.6f}", f"{r[1]:.6f}", f"{r[2]:.6f}",
-                                 f"{v[0]:.6f}", f"{v[1]:.6f}", f"{v[2]:.6f}",
-                                 f"{elems['a']:.6f}" if np.isfinite(elems['a']) else "",
-                                 f"{elems['e']:.6f}",
-                                 f"{elems['i']:.6f}",
-                                 f"{elems['RAAN']:.6f}",
-                                 f"{elems['arg_perigee']:.6f}",
-                                 f"{elems['true_anomaly']:.6f}"])
-    return out_path
+# --- TLE (optional) ---
+def tle_to_state(line1, line2):
+    if not SGP4_AVAILABLE:
+        raise RuntimeError("sgp4 not installed")
+    sat = Satrec.twoline2rv(line1, line2)
+    jd = sat.jdsatepoch + sat.jdsatepochF
+    jd_int = int(jd); fr = jd - jd_int
+    e, r_km, v_km_s = sat.sgp4(jd_int, fr)
+    if e != 0:
+        raise RuntimeError("SGP4 error code %d" % e)
+    return np.array(r_km)*1000.0, np.array(v_km_s)*1000.0, jd
 
-# ---------------------------
-# GUI Application
-# ---------------------------
-class OrbitGUI:
+# --- Orbit App ---
+class OrbitApp:
     def __init__(self, master):
         self.master = master
-        master.title("Orbit Propagator Calculator (RK4)")
+        master.title("Orbit Propagator + Map (responsive)")
+        self.batch_states = {}      # name -> list of (epoch,t,r,v)
+        self.results = []           # propagated results
+        self.plots2d = []          # store segments metadata for hover
+        self.tle_loaded_names = set()   # track names loaded from TLEs
 
+        # Params
         self.dt_var = tk.DoubleVar(value=10.0)
         self.steps_var = tk.IntVar(value=600)
         self.record_every_var = tk.IntVar(value=1)
         self.mu_var = tk.DoubleVar(value=MU_EARTH)
         self.use_tle_var = tk.BooleanVar(value=SGP4_AVAILABLE)
-        self.batch_list = []  # dicts: name, r0, v0, epoch
-        self.history_results = []
 
-        # layout frames
-        top = ttk.Frame(master); top.pack(fill=tk.X, padx=6, pady=6)
-        frm_input = ttk.LabelFrame(top, text="Input / Parameters"); frm_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        frm_buttons = ttk.Frame(top); frm_buttons.pack(side=tk.RIGHT, padx=6)
+        # Controls
+        topf = ttk.Frame(master); topf.pack(fill=tk.X, padx=6, pady=6)
+        self.chk_tle = ttk.Checkbutton(topf, text="Use TLE (sgp4)", variable=self.use_tle_var); self.chk_tle.pack(side=tk.LEFT)
+        self.btn_load_csv = ttk.Button(topf, text="Load CSV (states)", command=self.on_load_csv); self.btn_load_csv.pack(side=tk.LEFT, padx=4)
+        self.btn_load_tle = ttk.Button(topf, text="Load TLE (file)", command=self.on_load_tle); self.btn_load_tle.pack(side=tk.LEFT, padx=4)
+        self.btn_format = ttk.Button(topf, text="CSV Format", command=self.show_format); self.btn_format.pack(side=tk.LEFT, padx=4)
+        self.btn_run = ttk.Button(topf, text="Run Batch", command=self.on_run_batch); self.btn_run.pack(side=tk.LEFT, padx=6)
+        self.btn_clear_tle = ttk.Button(topf, text="Clear TLE", command=self.on_clear_tle); self.btn_clear_tle.pack(side=tk.LEFT, padx=4)
+        self.btn_clear_all = ttk.Button(topf, text="Clear All", command=self.on_clear_all); self.btn_clear_all.pack(side=tk.LEFT, padx=4)
 
-        # input widgets
-        ttk.Checkbutton(frm_input, text="Use TLE (sgp4)", variable=self.use_tle_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(frm_input, text="Load TLE file...", command=self.load_tle_file).grid(row=0, column=1, padx=4, pady=2)
-        ttk.Button(frm_input, text="Load state vectors file...", command=self.load_states_file).grid(row=0, column=2, padx=4, pady=2)
+        pf = ttk.Frame(master); pf.pack(fill=tk.X, padx=6)
+        ttk.Label(pf, text="dt (s)").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.dt_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(pf, text=" steps").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.steps_var, width=8).pack(side=tk.LEFT)
+        ttk.Label(pf, text=" record every").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.record_every_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(pf, text=" mu").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.mu_var, width=12).pack(side=tk.LEFT)
 
-        ttk.Label(frm_input, text="dt (s):").grid(row=1, column=0, sticky="e")
-        ttk.Entry(frm_input, textvariable=self.dt_var, width=10).grid(row=1, column=1, sticky="w")
-        ttk.Label(frm_input, text="steps:").grid(row=1, column=2, sticky="e")
-        ttk.Entry(frm_input, textvariable=self.steps_var, width=10).grid(row=1, column=3, sticky="w")
-
-        ttk.Label(frm_input, text="record every N step:").grid(row=2, column=0, sticky="e")
-        ttk.Entry(frm_input, textvariable=self.record_every_var, width=6).grid(row=2, column=1, sticky="w")
-        ttk.Label(frm_input, text="mu (m^3/s^2):").grid(row=2, column=2, sticky="e")
-        ttk.Entry(frm_input, textvariable=self.mu_var, width=30).grid(row=2, column=3, sticky="w")
-
-        # buttons
-        ttk.Button(frm_buttons, text="Run Batch", command=self.run_batch).pack(fill=tk.X, pady=2)
-        ttk.Button(frm_buttons, text="Plot Results", command=self.plot_results).pack(fill=tk.X, pady=2)
-        ttk.Button(frm_buttons, text="Export CSV", command=self.export_csv).pack(fill=tk.X, pady=2)
-        ttk.Button(frm_buttons, text="Clear", command=self.clear_all).pack(fill=tk.X, pady=2)
-
-        # status and log
-        frm_status = ttk.Frame(master); frm_status.pack(fill=tk.X, padx=6)
-        self.progress = ttk.Progressbar(frm_status, orient='horizontal', mode='determinate'); self.progress.pack(fill=tk.X, padx=4, pady=2)
-        self.log_text = tk.Text(master, height=10); self.log_text.pack(fill=tk.BOTH, padx=6, pady=6)
+        # progress / log
+        statf = ttk.Frame(master); statf.pack(fill=tk.X, padx=6, pady=2)
+        self.progress = ttk.Progressbar(statf, orient='horizontal', mode='determinate'); self.progress.pack(fill=tk.X, padx=4)
+        self.log = tk.Text(master, height=6); self.log.pack(fill=tk.X, padx=6, pady=6)
+        self._log(f"sgp4 available: {SGP4_AVAILABLE}")
 
         # plot area
-        frm_plot = ttk.LabelFrame(master, text="Trajectory Visualization"); frm_plot.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.fig = plt.Figure(figsize=(9,5))
-        self.ax3d = self.fig.add_subplot(121, projection='3d')
-        self.ax2d = self.fig.add_subplot(122)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=frm_plot)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        fig = plt.Figure(figsize=(10,6))
+        self.fig = fig
+        self.ax2d = fig.add_subplot(121)
+        self.ax3d = fig.add_subplot(122, projection='3d')
+        self.canvas = FigureCanvasTkAgg(fig, master=master)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.canvas.mpl_connect("motion_notify_event", self._on_move)
 
-        self.log("Ready. sgp4 available: {}".format(SGP4_AVAILABLE))
-
-    def log(self, *args):
-        s = " ".join(str(a) for a in args)
-        ts = datetime.utcnow().isoformat()
-        self.log_text.insert(tk.END, f"[{ts}] {s}\n")
-        self.log_text.see(tk.END)
-
-    def load_tle_file(self):
-        if not SGP4_AVAILABLE:
-            messagebox.showwarning("sgp4 not installed", "sgp4 not installed. Install with `pip install sgp4` to parse TLE automatically.")
-        path = filedialog.askopenfilename(title="Select TLE file", filetypes=[("Text files","*.tle *.txt *.dat"),("All files","*.*")])
-        if not path:
-            return
-        sats = read_tle_file(path)
-        self.batch_list = []
-        for (name, l1, l2) in sats:
-            if SGP4_AVAILABLE:
+        # image load (Pillow preferred). Only open files (not dirs)
+        self.map_image = None
+        preferred_names = ("1920px-Blue_Marble_2002.png",)
+        for fname in preferred_names:
+            if os.path.isfile(fname):
                 try:
-                    r, v, epoch = tle_to_state(l1, l2)
+                    if PIL_AVAILABLE:
+                        im = Image.open(fname)
+                        # downscale if too large
+                        maxdim = 2048
+                        if im.width > maxdim:
+                            scale = maxdim / im.width
+                            newh = int(im.height * scale)
+                            im = im.resize((maxdim, newh), Image.LANCZOS)
+                        self.map_image = np.array(im)
+                    else:
+                        self.map_image = plt.imread(fname)
+                    self._log(f"Loaded map image: {fname} (shape {getattr(self.map_image,'shape',None)})")
+                    break
                 except Exception as e:
-                    self.log(f"Failed to convert TLE {name}: {e}")
-                    continue
-            else:
-                self.log(f"Skipping TLE {name} (sgp4 not installed).")
-                continue
-            self.batch_list.append({'name': name, 'r0': r, 'v0': v, 'epoch': epoch})
-        self.log(f"Loaded {len(self.batch_list)} from TLE file: {os.path.basename(path)}")
+                    self._log(f"Failed to load map {fname}: {e}")
+        if self.map_image is None:
+            self._log("No earth_map image found — 2D plot will use simple graticule")
 
-    def load_states_file(self):
-        path = filedialog.askopenfilename(title="Select states file", filetypes=[("Text files","*.txt *.dat *.csv"),("All files","*.*")])
+        # annotation for hover
+        self.ann = self.ax2d.annotate("", xy=(0,0), xytext=(15,15), textcoords="offset points",
+                                     bbox=dict(boxstyle="round", fc="w"),
+                                     arrowprops=dict(arrowstyle="->"))
+        self.ann.set_visible(False)
+
+        # draw preview map shortly after startup
+        self.master.after(50, self._draw_map_preview)
+
+    # helper logger (main thread)
+    def _log(self, *args):
+        try:
+            s = " ".join(str(a) for a in args)
+            ts = datetime.utcnow().isoformat()
+            self.log.insert(tk.END, f"[{ts}] {s}\n")
+            self.log.see(tk.END)
+        except Exception:
+            pass
+
+    def show_format(self):
+        txt = (
+            "State Vector CSV format (recommended header):\n\n"
+            "sat_name,epoch_iso,t_offset_s,rx_m,ry_m,rz_m,vx_m_s,vy_m_s,vz_m_s\n\n"
+            "Units: position in meters (ECEF), velocity in m/s.\n"
+            "Example:\n"
+            "SAT_A,2025-09-18T19:39:19,0,7008100.0,0.0,0.0,0.0,7546.053,0.0\n\n"
+            "Also accepted: plain rows with 6 floats per row: rx ry rz vx vy vz\n"
+        )
+        messagebox.showinfo("CSV Format", txt)
+
+    # --- load CSV ---
+    def on_load_csv(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV files","*.csv *.txt"),("All files","*.*")])
         if not path:
-            return
-        entries = read_batch_states_file(path)
-        self.batch_list = []
-        for idx, (r, v) in enumerate(entries):
-            self.batch_list.append({'name': f"SAT_{idx}", 'r0': r, 'v0': v, 'epoch': datetime.utcnow()})
-        self.log(f"Loaded {len(self.batch_list)} states from: {os.path.basename(path)}")
-
-    def run_batch(self):
-        if not self.batch_list:
-            messagebox.showerror("No input", "No TLE or state vectors loaded.")
             return
         try:
-            dt = float(self.dt_var.get())
-            steps = int(self.steps_var.get())
-            record_every = int(self.record_every_var.get())
-            mu = float(self.mu_var.get())
+            sats = read_state_csv(path)
+            self.batch_states.update(sats)
+            self._log(f"Loaded {len(sats)} satellites from CSV: {path}")
+            self.master.after(10, self._draw_map_preview)
         except Exception as e:
-            messagebox.showerror("Invalid parameters", f"Check dt/steps/record_every/mu: {e}")
-            return
-        thread = threading.Thread(target=self._run_batch_thread, args=(dt, steps, record_every, mu), daemon=True)
-        thread.start()
+            self._log("Failed load CSV:", e)
+            messagebox.showerror("Error", f"Failed load CSV: {e}")
 
-    def _run_batch_thread(self, dt, steps, record_every, mu):
-        total = len(self.batch_list)
-        self.history_results = []
-        self.progress['value'] = 0
-        self.progress['maximum'] = total
-        for idx, sat in enumerate(self.batch_list):
-            name = sat['name']
-            r0 = sat['r0']
-            v0 = sat['v0']
-            epoch = sat.get('epoch', datetime.utcnow())
-            self.log(f"Propagating {name} (epoch {epoch.isoformat()}) ...")
-            hist = propagate_rk4_state(r0, v0, dt, steps, mu=mu, record_every=record_every)
-            self.history_results.append({'name': name, 'epoch': epoch, 'history': hist})
-            self.progress['value'] = idx + 1
-            self.master.after(1, lambda: None)
-        self.log("Batch propagation finished for {} satellites.".format(len(self.history_results)))
-        messagebox.showinfo("Done", "Batch propagation completed.")
-        self.master.after(10, self.plot_results)
-
-    def plot_results(self):
-        if not self.history_results:
-            messagebox.showwarning("No results", "No results to plot. Run batch propagation first.")
+    # --- load TLE ---
+    def on_load_tle(self):
+        if not SGP4_AVAILABLE:
+            messagebox.showwarning("sgp4 not installed", "Install sgp4 to load TLE automatically.")
             return
-        self.ax3d.cla()
-        self.ax2d.cla()
-        cmap = plt.cm.get_cmap('tab10')
-        for idx, sat in enumerate(self.history_results):
-            name = sat['name']
-            hist = sat['history']
-            rs = np.array([row[1] for row in hist])
-            self.ax3d.plot(rs[:,0], rs[:,1], rs[:,2], label=name, color=cmap(idx%10))
-            self.ax2d.plot(rs[:,0], rs[:,1], label=name, color=cmap(idx%10))
-            self.ax3d.scatter(rs[0,0], rs[0,1], rs[0,2], marker='o', s=20, color=cmap(idx%10))
-            self.ax3d.scatter(rs[-1,0], rs[-1,1], rs[-1,2], marker='x', s=20, color=cmap(idx%10))
-            self.ax2d.scatter(rs[0,0], rs[0,1], marker='o', s=20, color=cmap(idx%10))
-            self.ax2d.scatter(rs[-1,0], rs[-1,1], marker='x', s=20, color=cmap(idx%10))
-        self.ax3d.set_title("3D Trajectories (m)")
-        self.ax3d.set_xlabel("x (m)"); self.ax3d.set_ylabel("y (m)"); self.ax3d.set_zlabel("z (m)")
-        self.ax2d.set_title("XY Projection"); self.ax2d.set_xlabel("x (m)"); self.ax2d.set_ylabel("y (m)")
-        self.ax2d.axis('equal')
-        self.ax3d.legend(); self.ax2d.legend()
-        self.fig.tight_layout()
-        self.canvas.draw()
-
-    def export_csv(self):
-        if not self.history_results:
-            messagebox.showwarning("No results", "No results to export.")
-            return
-        path = filedialog.asksaveasfilename(title="Save results CSV", defaultextension=".csv", filetypes=[("CSV files","*.csv"),("All files","*.*")])
+        path = filedialog.askopenfilename(filetypes=[("TLE files","*.tle *.txt"),("All files","*.*")])
         if not path:
             return
-        save_results_csv(path, self.history_results)
-        self.log(f"Saved results to {path}")
-        messagebox.showinfo("Saved", f"Results saved to:\n{path}")
+        try:
+            with open(path) as f:
+                lines = [L.rstrip("\n") for L in f if L.strip()!='']
+            i = 0
+            loaded = 0
+            while i < len(lines):
+                if lines[i].startswith('1 ') or lines[i].startswith('2 '):
+                    l1 = lines[i]; l2 = lines[i+1] if i+1 < len(lines) else ''
+                    name = f"SAT_{len(self.batch_states)}"
+                    i += 2
+                else:
+                    name = lines[i]; l1 = lines[i+1]; l2 = lines[i+2]
+                    i += 3
+                try:
+                    r, v, jd = tle_to_state(l1, l2)
+                except Exception as e:
+                    self._log(f"Failed parse TLE for {name}: {e}")
+                    continue
+                self.batch_states.setdefault(name, []).append((jd, 0.0, r, v))
+                self.tle_loaded_names.add(name)
+                loaded += 1
+            self._log(f"Loaded {loaded} sats from TLE file")
+            self.master.after(10, self._draw_map_preview)
+        except Exception as e:
+            self._log("Failed load TLE:", e)
+            messagebox.showerror("Error", f"Failed load TLE: {e}")
 
-    def clear_all(self):
-        self.batch_list = []
-        self.history_results = []
+    # --- run batch (threaded) ---
+    def on_run_batch(self):
+        if not self.batch_states:
+            messagebox.showerror("No input", "Load CSV or TLE first")
+            return
+        try:
+            dt = float(self.dt_var.get()); steps = int(self.steps_var.get())
+            rec = int(self.record_every_var.get()); mu = float(self.mu_var.get())
+        except Exception as e:
+            messagebox.showerror("Params", f"Invalid params: {e}")
+            return
+
+        # disable controls
+        self._set_controls_state("disabled")
         self.progress['value'] = 0
-        self.ax3d.cla(); self.ax2d.cla(); self.canvas.draw()
-        self.log_text.delete(1.0, tk.END)
-        self.log("Cleared all data.")
+        total = len(self.batch_states)
+        self._log(f"Starting batch for {total} sats (threaded)...")
 
-# ---------------------------
+        def worker():
+            try:
+                results = []
+                names = list(self.batch_states.keys())
+                for idx, name in enumerate(names):
+                    entries = self.batch_states[name]
+                    first = entries[0]
+                    if len(first) == 4:
+                        _, _, r0, v0 = first
+                    elif len(first) == 2:
+                        r0, v0 = first
+                    else:
+                        continue
+                    def progress_cb(frac, msg):
+                        self.master.after(1, lambda: self._update_progress(frac, msg))
+                    hist = propagate_rk4(r0, v0, dt, steps, record_every=rec, mu=mu,
+                                        progress_cb=progress_cb, sat_index=idx, total_sats=total)
+                    results.append({'name': name, 'epoch': first[0], 'history': hist})
+                    self.master.after(1, lambda idx=idx: self._update_progress((idx+1)/total, f"Completed sat {idx+1}/{total}"))
+                self.master.after(1, lambda: self._worker_done(results))
+            except Exception as e:
+                tb = traceback.format_exc()
+                self.master.after(1, lambda: self._worker_failed(str(e), tb))
+
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+
+    def _update_progress(self, frac, msg=""):
+        try:
+            self.progress['value'] = max(0.0, min(100.0, frac*100.0))
+            if msg:
+                self._log(msg)
+        except Exception:
+            pass
+
+    def _worker_done(self, results):
+        self.results = results
+        self._log("Batch propagation finished for {} satellites.".format(len(results)))
+        self._set_controls_state("normal")
+        try:
+            self.plot_all()
+        except Exception as e:
+            self._log("Plot failed:", e)
+
+    def _worker_failed(self, err_str, tb):
+        self._log("Worker failed:", err_str)
+        self._log(tb)
+        messagebox.showerror("Worker error", f"{err_str}\nSee log for traceback.")
+        self._set_controls_state("normal")
+
+    def _set_controls_state(self, state):
+        # state: "normal" or "disabled"
+        for w in (self.btn_load_csv, self.btn_load_tle, self.btn_run, self.btn_format, self.btn_clear_tle, self.btn_clear_all):
+            try:
+                w.config(state=state)
+            except Exception:
+                pass
+        try:
+            self.chk_tle.config(state=state)
+        except Exception:
+            pass
+
+    # --- draw map preview ---
+    def _draw_map_preview(self):
+        try:
+            self.ax2d.cla()
+            if self.map_image is not None:
+                self.ax2d.imshow(self.map_image, origin='upper', extent=[-180,180,-90,90],
+                                 aspect='auto', interpolation='bilinear', zorder=0)
+            else:
+                self.ax2d.set_facecolor('#e6f7ff'); self.ax2d.grid(color='white', linestyle='--')
+            self.ax2d.set_xlim(-180,180); self.ax2d.set_ylim(-90,90)
+            self.ax2d.set_xlabel("Longitude (deg)"); self.ax2d.set_ylabel("Latitude (deg)")
+            self.ax2d.set_title("Ground tracks (lon/lat)")
+            self.canvas.draw_idle()
+        except Exception as e:
+            self._log("Failed to draw map preview:", e)
+
+    # --- plotting / hover helpers ---
+    def _split_lon_wrap(self, lons, lats):
+        lons = np.asarray(lons); lats = np.asarray(lats)
+        diffs = np.abs(np.diff(lons))
+        splits = np.where(diffs > 180)[0] + 1
+        if len(splits) == 0:
+            return [(lons, lats)]
+        segments = []; start = 0
+        for s in splits:
+            segments.append((lons[start:s], lats[start:s])); start = s
+        segments.append((lons[start:], lats[start:]))
+        return segments
+
+    def plot_all(self):
+        if not self.results:
+            # still show map preview if nothing propagated
+            self._draw_map_preview()
+            return
+        self.plots2d.clear()
+        self.ax2d.cla()
+        if self.map_image is not None:
+            self.ax2d.imshow(self.map_image, origin='upper', extent=[-180,180,-90,90],
+                             aspect='auto', interpolation='bilinear', zorder=0)
+        else:
+            self.ax2d.set_facecolor('#e6f7ff'); self.ax2d.grid(color='white', linestyle='--')
+
+        self.ax3d.cla()
+        max_R = R_EARTH
+        for sat in self.results:
+            for t,r,v in sat['history']:
+                rr = np.linalg.norm(r)
+                if rr > max_R: max_R = rr
+        lim = max_R * 1.2
+
+        # 3D Earth
+        u = np.linspace(0, 2*np.pi, 60); v_ang = np.linspace(0, np.pi, 30)
+        uu, vv = np.meshgrid(u, v_ang)
+        xs = R_EARTH * np.cos(uu) * np.sin(vv); ys = R_EARTH * np.sin(uu) * np.sin(vv)
+        zs = R_EARTH * np.cos(vv)
+        try:
+            self.ax3d.plot_surface(xs, ys, zs, rstride=3, cstride=3, color='lightblue', alpha=0.6, linewidth=0, zorder=0)
+        except Exception:
+            pass
+
+        cmap = plt.cm.get_cmap('tab10')
+        for idx, sat in enumerate(self.results):
+            name = sat['name']; hist = sat['history']
+            arr = np.array([r for (t,r,v) in hist])
+            if arr.size == 0: continue
+            self.ax3d.plot(arr[:,0], arr[:,1], arr[:,2], label=name, color=cmap(idx%10), linewidth=1.0)
+            lats=[]; lons=[]; times=[]; alts=[]
+            for (t,r,v) in hist:
+                lat, lon, alt = ecef_to_latlon(r)
+                lats.append(lat); lons.append(lon); times.append(t); alts.append(alt)
+            lons = np.array(lons); lats = np.array(lats); times = np.array(times); alts = np.array(alts)
+            segments = self._split_lon_wrap(lons, lats)
+            idx_start = 0
+            for seg_lon, seg_lat in segments:
+                seg_len = len(seg_lon)
+                seg_times = times[idx_start: idx_start + seg_len]
+                seg_alts = alts[idx_start: idx_start + seg_len]
+                ln, = self.ax2d.plot(seg_lon, seg_lat, marker='.', linestyle='-', color=cmap(idx%10),
+                                      markersize=2, label=name if idx_start==0 else "", zorder=5)
+                self.plots2d.append({'line': ln, 'name': name, 'lon': seg_lon.copy(), 'lat': seg_lat.copy(),
+                                     'times': seg_times.copy(), 'alts': seg_alts.copy(), 'color': cmap(idx%10)})
+                idx_start += seg_len
+
+        self.ax2d.set_xlim(-180,180); self.ax2d.set_ylim(-90,90)
+        self.ax2d.set_xlabel("Longitude (deg)"); self.ax2d.set_ylabel("Latitude (deg)")
+        self.ax2d.set_title("Ground tracks (lon/lat)")
+        handles, labels = self.ax2d.get_legend_handles_labels()
+        if handles:
+            by_label = dict(zip(labels, handles))
+            self.ax2d.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize='small')
+
+        self._set_3d_equal_axis(lim)
+        self.ax3d.set_title("3D trajectories (meters)")
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def _set_3d_equal_axis(self, lim):
+        self.ax3d.set_xlim(-lim, lim); self.ax3d.set_ylim(-lim, lim); self.ax3d.set_zlim(-lim, lim)
+        try:
+            self.ax3d.set_box_aspect([1,1,1])
+        except Exception:
+            pass
+
+    # Hover
+    def _on_move(self, event):
+        if event.inaxes != self.ax2d:
+            if self.ann.get_visible():
+                self.ann.set_visible(False); self.canvas.draw_idle()
+            return
+        if not self.plots2d:
+            return
+        mx, my = event.xdata, event.ydata
+        if mx is None or my is None:
+            return
+        best=None; best_dist=1e9
+        for seg in self.plots2d:
+            lon = seg['lon']; lat = seg['lat']
+            if lon.size == 0: continue
+            dx = lon - mx; dy = lat - my
+            dx = (dx + 180) % 360 - 180
+            d2 = dx*dx + dy*dy
+            i = int(np.argmin(d2))
+            dist = d2[i]
+            if dist < best_dist:
+                best_dist = dist; best=(seg,i,math.sqrt(dist))
+        if best is not None and best[2] < 4.0:
+            seg, idx_pt, distdeg = best[0], best[1], best[2]
+            lon_pt = float(seg['lon'][idx_pt]); lat_pt = float(seg['lat'][idx_pt])
+            t_off = float(seg['times'][idx_pt]) if idx_pt < len(seg['times']) else 0.0
+            alt = float(seg['alts'][idx_pt]) if idx_pt < len(seg['alts']) else 0.0
+            txt = f"{seg['name']}\n t={t_off:.0f}s\n lat={lat_pt:.3f}°\n lon={lon_pt:.3f}°\n alt={alt:.0f} m"
+            self.ann.xy = (lon_pt, lat_pt)
+            self.ann.set_text(txt)
+            self.ann.get_bbox_patch().set_alpha(0.9)
+            self.ann.set_visible(True)
+            self.canvas.draw_idle()
+        else:
+            if self.ann.get_visible():
+                self.ann.set_visible(False)
+                self.canvas.draw_idle()
+
+    # --- Clear TLE only ---
+    def on_clear_tle(self):
+        if not self.tle_loaded_names:
+            self._log("No TLE-loaded satellites to clear.")
+            return
+        removed = []
+        for name in list(self.tle_loaded_names):
+            if name in self.batch_states:
+                del self.batch_states[name]
+                removed.append(name)
+        self.tle_loaded_names.clear()
+        # remove results for removed sats if present
+        if self.results:
+            self.results = [r for r in self.results if r['name'] not in removed]
+        self._log(f"Cleared {len(removed)} TLE-loaded satellites: {', '.join(removed) if removed else '(none)'}")
+        self.master.after(10, self._draw_map_preview)
+
+    # --- Clear everything ---
+    def on_clear_all(self):
+        self.batch_states.clear()
+        self.results.clear()
+        self.tle_loaded_names.clear()
+        self.plots2d.clear()
+        self.progress['value'] = 0
+        self.log.delete(1.0, tk.END)
+        self._log("Cleared all loaded satellites, results, and logs.")
+        self.master.after(10, self._draw_map_preview)
+
 # Main
-# ---------------------------
 def main():
     root = tk.Tk()
-    app = OrbitGUI(root)
-    root.geometry("1100x700")
+    root.geometry("1200x760")
+    app = OrbitApp(root)
     root.mainloop()
 
 if __name__ == "__main__":
