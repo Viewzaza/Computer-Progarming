@@ -1,14 +1,9 @@
-# orbit_propagator_with_map.py
-# Responsive RK4 orbit propagator GUI with:
-#  - 2D ground-track with Blue Marble/equirectangular background
-#  - 3D trajectories with Earth sphere
-#  - Load CSV (state vectors), optional TLE (sgp4)
-#  - Hover info on ground tracks
-#  - Threaded propagation with progress, robust image loading (skips directories)
-#  - CLEAR TLE button (removes TLE-loaded sats) and CLEAR ALL button
-#
-# Run: python orbit_propagator_with_map.py
-# Requires: numpy, matplotlib. Recommended: pillow (pip install pillow). Optional: sgp4.
+#@Viewzaza
+
+
+# orbit_propagator_with_map_fixed_hover_v2.py
+# Fixed hover: recreate annotation after clearing 2D axes, robust hover handling.
+# Everything else kept (RK4, threading, Clear TLE/All, Blue Marble background).
 
 import os, math, threading, csv, traceback
 from datetime import datetime
@@ -73,18 +68,16 @@ def propagate_rk4(r0, v0, dt, steps, record_every=1, mu=MU_EARTH, progress_cb=No
     return history
 
 # --- Utilities ---
-
 def eci_to_ecef(r, t):
     # Earth rotation rate (rad/s)
-    omega = 7.2921159e-5  
-    theta = omega * t   # rotation angle since epoch
+    omega = 7.2921159e-5
+    theta = omega * t
     rot = np.array([
-        [ np.cos(theta),  np.sin(theta), 0],
-        [-np.sin(theta),  np.cos(theta), 0],
-        [ 0,              0,             1]
+        [ math.cos(theta),  math.sin(theta), 0],
+        [-math.sin(theta),  math.cos(theta), 0],
+        [ 0,                0,               1]
     ])
     return rot @ r
-
 
 def ecef_to_latlon(r):
     x, y, z = r
@@ -153,11 +146,11 @@ def tle_to_state(line1, line2):
 class OrbitApp:
     def __init__(self, master):
         self.master = master
-        master.title("Orbit Propagator + Map (responsive)")
-        self.batch_states = {}      # name -> list of (epoch,t,r,v)
-        self.results = []           # propagated results
-        self.plots2d = []          # store segments metadata for hover
-        self.tle_loaded_names = set()   # track names loaded from TLEs
+        master.title("Orbit Propagator Calculator")
+        self.batch_states = {}
+        self.results = []
+        self.plots2d = []          # list of segment dicts
+        self.tle_loaded_names = set()
 
         # Params
         self.dt_var = tk.DoubleVar(value=10.0)
@@ -180,7 +173,7 @@ class OrbitApp:
         ttk.Label(pf, text="dt (s)").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.dt_var, width=8).pack(side=tk.LEFT)
         ttk.Label(pf, text=" steps").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.steps_var, width=8).pack(side=tk.LEFT)
         ttk.Label(pf, text=" record every").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.record_every_var, width=5).pack(side=tk.LEFT)
-        ttk.Label(pf, text=" mu").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.mu_var, width=12).pack(side=tk.LEFT)
+        ttk.Label(pf, text=" mu").pack(side=tk.LEFT); ttk.Entry(pf, textvariable=self.mu_var, width=20).pack(side=tk.LEFT)
 
         # progress / log
         statf = ttk.Frame(master); statf.pack(fill=tk.X, padx=6, pady=2)
@@ -195,17 +188,17 @@ class OrbitApp:
         self.ax3d = fig.add_subplot(122, projection='3d')
         self.canvas = FigureCanvasTkAgg(fig, master=master)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        # connect motion event
         self.canvas.mpl_connect("motion_notify_event", self._on_move)
 
         # image load (Pillow preferred). Only open files (not dirs)
         self.map_image = None
-        preferred_names = ("1920px-Blue_Marble_2002.png",)
+        preferred_names = ("1920px-Blue_Marble_2002.png", "3840px-Blue_Marble_2002.png", "earth_map.png", "earth_map.jpg")
         for fname in preferred_names:
             if os.path.isfile(fname):
                 try:
                     if PIL_AVAILABLE:
                         im = Image.open(fname)
-                        # downscale if too large
                         maxdim = 2048
                         if im.width > maxdim:
                             scale = maxdim / im.width
@@ -221,12 +214,8 @@ class OrbitApp:
         if self.map_image is None:
             self._log("No earth_map image found — 2D plot will use simple graticule")
 
-        # annotation for hover
-        self.ann = self.ax2d.annotate("", xy=(0,0), xytext=(15,15), textcoords="offset points",
-                                     bbox=dict(boxstyle="round", fc="w"),
-                                     arrowprops=dict(arrowstyle="->"))
-        self.ann.set_visible(False)
-
+        # annotation placeholder (will be created/attached in _ensure_annotation)
+        self.ann = None
         # draw preview map shortly after startup
         self.master.after(50, self._draw_map_preview)
 
@@ -362,8 +351,6 @@ class OrbitApp:
         except Exception as e:
             self._log("Plot failed:", e)
 
-0
-
     def _worker_failed(self, err_str, tb):
         self._log("Worker failed:", err_str)
         self._log(tb)
@@ -371,7 +358,6 @@ class OrbitApp:
         self._set_controls_state("normal")
 
     def _set_controls_state(self, state):
-        # state: "normal" or "disabled"
         for w in (self.btn_load_csv, self.btn_load_tle, self.btn_run, self.btn_format, self.btn_clear_tle, self.btn_clear_all):
             try:
                 w.config(state=state)
@@ -382,10 +368,35 @@ class OrbitApp:
         except Exception:
             pass
 
+    # Ensure annotation exists and is attached to current ax2d
+    def _ensure_annotation(self):
+        # remove old annotation if it exists and is not on current axes
+        try:
+            if getattr(self, 'ann', None) is not None:
+                # if ann exists but belongs to a different axes (because axes was cleared), remove
+                if getattr(self.ann, 'axes', None) != self.ax2d:
+                    try:
+                        self.ann.remove()
+                    except Exception:
+                        pass
+                    self.ann = None
+        except Exception:
+            self.ann = None
+
+        if self.ann is None:
+            # create new annotation attached to current ax2d
+            self.ann = self.ax2d.annotate("", xy=(0,0), xytext=(15,15), textcoords="offset points",
+                                          bbox=dict(boxstyle="round", fc="w"),
+                                          arrowprops=dict(arrowstyle="->"))
+            self.ann.set_visible(False)
+
     # --- draw map preview ---
     def _draw_map_preview(self):
         try:
             self.ax2d.cla()
+            # recreate annotation after clearing axes
+            self._ensure_annotation()
+
             if self.map_image is not None:
                 self.ax2d.imshow(self.map_image, origin='upper', extent=[-180,180,-90,90],
                                  aspect='auto', interpolation='bilinear', zorder=0)
@@ -401,6 +412,8 @@ class OrbitApp:
     # --- plotting / hover helpers ---
     def _split_lon_wrap(self, lons, lats):
         lons = np.asarray(lons); lats = np.asarray(lats)
+        if lons.size < 2:
+            return [(lons, lats)]
         diffs = np.abs(np.diff(lons))
         splits = np.where(diffs > 180)[0] + 1
         if len(splits) == 0:
@@ -411,15 +424,18 @@ class OrbitApp:
         segments.append((lons[start:], lats[start:]))
         return segments
 
-
-
     def plot_all(self):
+        # ensure annotation exists (since we'll clear axes)
+        self._ensure_annotation()
+
         if not self.results:
-            # still show map preview if nothing propagated
             self._draw_map_preview()
             return
         self.plots2d.clear()
         self.ax2d.cla()
+        # recreate annotation after clearing axes
+        self._ensure_annotation()
+
         if self.map_image is not None:
             self.ax2d.imshow(self.map_image, origin='upper', extent=[-180,180,-90,90],
                              aspect='auto', interpolation='bilinear', zorder=0)
@@ -450,11 +466,15 @@ class OrbitApp:
             arr = np.array([r for (t,r,v) in hist])
             if arr.size == 0: continue
             self.ax3d.plot(arr[:,0], arr[:,1], arr[:,2], label=name, color=cmap(idx%10), linewidth=1.0)
+
+            # compute lats/lons using ECI->ECEF rotation based on time t
             lats=[]; lons=[]; times=[]; alts=[]
-            for (t,r,v) in hist:
-                lat, lon, alt = ecef_to_latlon(r)
+            for (t, r, v) in hist:
+                r_ecef = eci_to_ecef(r, t)   # apply Earth rotation
+                lat, lon, alt = ecef_to_latlon(r_ecef)
                 lats.append(lat); lons.append(lon); times.append(t); alts.append(alt)
             lons = np.array(lons); lats = np.array(lats); times = np.array(times); alts = np.array(alts)
+
             segments = self._split_lon_wrap(lons, lats)
             idx_start = 0
             for seg_lon, seg_lat in segments:
@@ -462,7 +482,7 @@ class OrbitApp:
                 seg_times = times[idx_start: idx_start + seg_len]
                 seg_alts = alts[idx_start: idx_start + seg_len]
                 ln, = self.ax2d.plot(seg_lon, seg_lat, marker='.', linestyle='-', color=cmap(idx%10),
-                                      markersize=2, label=name if idx_start==0 else "", zorder=5)
+                                      markersize=2, label=name if idx_start==0 else "", zorder=5, picker=2)
                 self.plots2d.append({'line': ln, 'name': name, 'lon': seg_lon.copy(), 'lat': seg_lat.copy(),
                                      'times': seg_times.copy(), 'alts': seg_alts.copy(), 'color': cmap(idx%10)})
                 idx_start += seg_len
@@ -489,39 +509,56 @@ class OrbitApp:
 
     # Hover
     def _on_move(self, event):
+        # only care about motion over the 2D axes
         if event.inaxes != self.ax2d:
-            if self.ann.get_visible():
+            if self.ann is not None and self.ann.get_visible():
                 self.ann.set_visible(False); self.canvas.draw_idle()
             return
         if not self.plots2d:
+            if self.ann is not None and self.ann.get_visible():
+                self.ann.set_visible(False); self.canvas.draw_idle()
             return
         mx, my = event.xdata, event.ydata
         if mx is None or my is None:
             return
-        best=None; best_dist=1e9
+
+        best = None
+        best_dist = float('inf')
+        # find nearest point among all segments
         for seg in self.plots2d:
             lon = seg['lon']; lat = seg['lat']
             if lon.size == 0: continue
-            dx = lon - mx; dy = lat - my
+            dx = lon - mx
+            dy = lat - my
+            # shortest lon diff across wrap
             dx = (dx + 180) % 360 - 180
             d2 = dx*dx + dy*dy
-            i = int(np.argmin(d2))
-            dist = d2[i]
-            if dist < best_dist:
-                best_dist = dist; best=(seg,i,math.sqrt(dist))
-        if best is not None and best[2] < 4.0:
+            idx_min = int(np.argmin(d2))
+            dist_sq = float(d2[idx_min])
+            if dist_sq < best_dist:
+                best_dist = dist_sq
+                best = (seg, idx_min, math.sqrt(dist_sq))
+
+        # threshold in degrees (tuneable)
+        threshold_deg = 3.0
+        if best is not None and best[2] < threshold_deg:
             seg, idx_pt, distdeg = best[0], best[1], best[2]
             lon_pt = float(seg['lon'][idx_pt]); lat_pt = float(seg['lat'][idx_pt])
             t_off = float(seg['times'][idx_pt]) if idx_pt < len(seg['times']) else 0.0
             alt = float(seg['alts'][idx_pt]) if idx_pt < len(seg['alts']) else 0.0
             txt = f"{seg['name']}\n t={t_off:.0f}s\n lat={lat_pt:.3f}°\n lon={lon_pt:.3f}°\n alt={alt:.0f} m"
-            self.ann.xy = (lon_pt, lat_pt)
-            self.ann.set_text(txt)
-            self.ann.get_bbox_patch().set_alpha(0.9)
-            self.ann.set_visible(True)
-            self.canvas.draw_idle()
+            # ensure annotation exists and is attached
+            self._ensure_annotation()
+            prev_visible = self.ann.get_visible()
+            prev_text = self.ann.get_text() if prev_visible else None
+            if (not prev_visible) or (txt != prev_text):
+                self.ann.xy = (lon_pt, lat_pt)
+                self.ann.set_text(txt)
+                self.ann.get_bbox_patch().set_alpha(0.95)
+                self.ann.set_visible(True)
+                self.canvas.draw_idle()
         else:
-            if self.ann.get_visible():
+            if self.ann is not None and self.ann.get_visible():
                 self.ann.set_visible(False)
                 self.canvas.draw_idle()
 
@@ -536,7 +573,6 @@ class OrbitApp:
                 del self.batch_states[name]
                 removed.append(name)
         self.tle_loaded_names.clear()
-        # remove results for removed sats if present
         if self.results:
             self.results = [r for r in self.results if r['name'] not in removed]
         self._log(f"Cleared {len(removed)} TLE-loaded satellites: {', '.join(removed) if removed else '(none)'}")
