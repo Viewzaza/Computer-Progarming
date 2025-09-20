@@ -1,10 +1,6 @@
-#@Viewzaza
-
-
-# orbit_propagator_with_map_fixed_hover_v2.py
-# Fixed hover: recreate annotation after clearing 2D axes, robust hover handling.
-# Everything else kept (RK4, threading, Clear TLE/All, Blue Marble background).
-
+#@Viewzaza,Group12
+# Orbit Propagator Calculator (fixed annotation z-order & legend behaviour)
+# please installs every library that being used in this project before run it.
 import os, math, threading, csv, traceback
 from datetime import datetime
 import tkinter as tk
@@ -24,7 +20,7 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-# Optional sgp4
+# Optional sgp4 (using some time)
 SGP4_AVAILABLE = False
 try:
     from sgp4.api import Satrec, jday
@@ -34,7 +30,7 @@ except Exception:
 
 # Constants
 R_EARTH = 6371000.0
-MU_EARTH = 3.986004418e14
+MU_EARTH = 3.986004418e14 #Earth mass constants
 
 # --- Physics + RK4 ---
 def accel_two_body(r, mu=MU_EARTH):
@@ -384,11 +380,20 @@ class OrbitApp:
             self.ann = None
 
         if self.ann is None:
-            # create new annotation attached to current ax2d
+            # create new annotation attached to current ax2d with high zorder and no clipping
             self.ann = self.ax2d.annotate("", xy=(0,0), xytext=(15,15), textcoords="offset points",
                                           bbox=dict(boxstyle="round", fc="w"),
-                                          arrowprops=dict(arrowstyle="->"))
+                                          arrowprops=dict(arrowstyle="->"),
+                                          zorder=1000)
             self.ann.set_visible(False)
+            try:
+                # prevent being clipped by axis patch
+                self.ann.set_clip_on(False)
+                # ensure it's an artist of ax2d and on top
+                self.ax2d.add_artist(self.ann)
+                self.ann.set_zorder(1000)
+            except Exception:
+                pass
 
     # --- draw map preview ---
     def _draw_map_preview(self):
@@ -481,6 +486,7 @@ class OrbitApp:
                 seg_len = len(seg_lon)
                 seg_times = times[idx_start: idx_start + seg_len]
                 seg_alts = alts[idx_start: idx_start + seg_len]
+                # plot with explicit zorder so annotation will be on top
                 ln, = self.ax2d.plot(seg_lon, seg_lat, marker='.', linestyle='-', color=cmap(idx%10),
                                       markersize=2, label=name if idx_start==0 else "", zorder=5, picker=2)
                 self.plots2d.append({'line': ln, 'name': name, 'lon': seg_lon.copy(), 'lat': seg_lat.copy(),
@@ -493,7 +499,12 @@ class OrbitApp:
         handles, labels = self.ax2d.get_legend_handles_labels()
         if handles:
             by_label = dict(zip(labels, handles))
-            self.ax2d.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize='small')
+            lg = self.ax2d.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize='small')
+            try:
+                lg.set_zorder(10)              # legend below annotation (annotation z=1000)
+                lg.get_frame().set_alpha(0.85) # slightly transparent
+            except Exception:
+                pass
 
         self._set_3d_equal_axis(lim)
         self.ax3d.set_title("3D trajectories (meters)")
@@ -509,7 +520,7 @@ class OrbitApp:
 
     # Hover
     def _on_move(self, event):
-        # only care about motion over the 2D axes
+
         if event.inaxes != self.ax2d:
             if self.ann is not None and self.ann.get_visible():
                 self.ann.set_visible(False); self.canvas.draw_idle()
@@ -524,13 +535,13 @@ class OrbitApp:
 
         best = None
         best_dist = float('inf')
-        # find nearest point among all segments
+
         for seg in self.plots2d:
             lon = seg['lon']; lat = seg['lat']
             if lon.size == 0: continue
             dx = lon - mx
             dy = lat - my
-            # shortest lon diff across wrap
+
             dx = (dx + 180) % 360 - 180
             d2 = dx*dx + dy*dy
             idx_min = int(np.argmin(d2))
@@ -554,7 +565,10 @@ class OrbitApp:
             if (not prev_visible) or (txt != prev_text):
                 self.ann.xy = (lon_pt, lat_pt)
                 self.ann.set_text(txt)
-                self.ann.get_bbox_patch().set_alpha(0.95)
+                try:
+                    self.ann.get_bbox_patch().set_alpha(0.95)
+                except Exception:
+                    pass
                 self.ann.set_visible(True)
                 self.canvas.draw_idle()
         else:
@@ -562,7 +576,7 @@ class OrbitApp:
                 self.ann.set_visible(False)
                 self.canvas.draw_idle()
 
-    # --- Clear TLE only ---
+    # --- Clear TLE only (inputs only; keep plots) ---
     def on_clear_tle(self):
         if not self.tle_loaded_names:
             self._log("No TLE-loaded satellites to clear.")
@@ -573,10 +587,13 @@ class OrbitApp:
                 del self.batch_states[name]
                 removed.append(name)
         self.tle_loaded_names.clear()
+        # NOTE: do NOT remove existing plotted results so graph remains visible
+        self._log(f"Cleared {len(removed)} TLE-loaded satellites from inputs: {', '.join(removed) if removed else '(none)'}")
+        # refresh display (keep plotted results)
         if self.results:
-            self.results = [r for r in self.results if r['name'] not in removed]
-        self._log(f"Cleared {len(removed)} TLE-loaded satellites: {', '.join(removed) if removed else '(none)'}")
-        self.master.after(10, self._draw_map_preview)
+            self.master.after(10, self.plot_all)
+        else:
+            self.master.after(10, self._draw_map_preview)
 
     # --- Clear everything ---
     def on_clear_all(self):
@@ -589,7 +606,7 @@ class OrbitApp:
         self._log("Cleared all loaded satellites, results, and logs.")
         self.master.after(10, self._draw_map_preview)
 
-# Main
+
 def main():
     root = tk.Tk()
     root.geometry("1200x760")
